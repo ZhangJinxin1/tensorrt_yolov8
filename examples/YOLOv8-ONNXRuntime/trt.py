@@ -11,6 +11,9 @@ import random
 import sys
 import threading
 import time
+import pycuda.autoinit
+import pycuda.driver as cuda
+import tensorrt as trt
 
 from ultralytics.utils import ASSETS, yaml_load
 from ultralytics.utils.checks import check_requirements, check_yaml
@@ -19,7 +22,7 @@ from ultralytics.utils.checks import check_requirements, check_yaml
 class YOLOv8:
     """YOLOv8 object detection model class for handling inference and visualization."""
 
-    def __init__(self, onnx_model, input_image, confidence_thres, iou_thres):
+    def __init__(self, onnx_model,input_image, confidence_thres, iou_thres):
         """
         Initializes an instance of the YOLOv8 class.
 
@@ -29,7 +32,55 @@ class YOLOv8:
             confidence_thres: Confidence threshold for filtering detections.
             iou_thres: IoU (Intersection over Union) threshold for non-maximum suppression.
         """
-        self.onnx_model = onnx_model
+        engine_file_path = "/root/zjx/ultralytics/yolov8n.engine"
+         # Create a Context on this device,
+        self.ctx = cuda.Device(0).make_context()
+        stream = cuda.Stream()
+        TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+        runtime = trt.Runtime(TRT_LOGGER)
+
+        # Deserialize the engine from file
+        with open(engine_file_path, "rb") as f:
+            engine = runtime.deserialize_cuda_engine(f.read())  # 持久化反序列化
+        context = engine.create_execution_context()  # 创建 context 进行 inference
+        
+        host_inputs = []
+        cuda_inputs = []
+        host_outputs = []
+        cuda_outputs = []
+        bindings = []
+
+        for binding in engine:
+            print('bingding:', binding, engine.get_binding_shape(binding))
+            size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
+            dtype = trt.nptype(engine.get_binding_dtype(binding))
+            # Allocate host and device buffers 申请锁页内存
+            host_mem = cuda.pagelocked_empty(size, dtype)
+            cuda_mem = cuda.mem_alloc(host_mem.nbytes)
+            # Append the device buffer to device bindings.
+            bindings.append(int(cuda_mem))
+            # Append to the appropriate list.
+            if engine.binding_is_input(binding):
+                self.input_width = engine.get_binding_shape(binding)[-1]
+                self.input_height = engine.get_binding_shape(binding)[-2]
+                host_inputs.append(host_mem)
+                cuda_inputs.append(cuda_mem)
+            else:
+                host_outputs.append(host_mem)
+                cuda_outputs.append(cuda_mem)
+
+        # Store
+        self.stream = stream
+        self.context = context
+        self.engine = engine
+        self.host_inputs = host_inputs
+        self.cuda_inputs = cuda_inputs
+        self.host_outputs = host_outputs
+        self.cuda_outputs = cuda_outputs
+        self.bindings = bindings
+        self.batch_size = engine.max_batch_size
+        
+        
         self.input_image = input_image
         self.confidence_thres = confidence_thres
         self.iou_thres = iou_thres
@@ -39,6 +90,45 @@ class YOLOv8:
 
         # Generate a color palette for the classes
         self.color_palette = np.random.uniform(0, 255, size=(len(self.classes), 3))
+    def infer(self):
+        # Make self the active context, pushing it on top of the context stack.
+        self.ctx.push()
+        # Restore
+        stream = self.stream
+        context = self.context
+        engine = self.engine
+        host_inputs = self.host_inputs
+        cuda_inputs = self.cuda_inputs
+        host_outputs = self.host_outputs
+        cuda_outputs = self.cuda_outputs
+        bindings = self.bindings
+
+        # Do image preprocess
+        img_data = self.preprocess()
+        input_image = np.ascontiguousarray(img_data)
+        print("---xxxxx-----pre-------",type(img_data))
+        print("---xxxxx-----pre-------",img_data.shape)
+        
+        # Copy input image to host buffer
+        np.copyto(host_inputs[0], input_image.ravel())
+        start = time.time()
+        # Transfer input data  to the GPU.
+        cuda.memcpy_htod_async(cuda_inputs[0], host_inputs[0], stream)
+        # Run inference.
+        # context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+        context.execute_async(batch_size=self.batch_size, bindings=bindings, stream_handle=stream.handle)
+        # Transfer predictions back from the GPU.
+        cuda.memcpy_dtoh_async(host_outputs[0], cuda_outputs[0], stream)
+        # Synchronize the stream
+        stream.synchronize()
+        end = time.time()
+        hao = end -start
+        print("xxxx-------xxxxx---------------", hao*1000)
+        # Remove any context from the top of the context stack, deactivating it.
+        self.ctx.pop()
+        # Here we use the first row of output in that batch_size = 1
+        output = host_outputs[0]
+        return output
 
     def draw_detections(self, img, box, score, class_id):
         """
@@ -87,13 +177,7 @@ class YOLOv8:
         Returns:
             image_data: Preprocessed image data ready for inference.
         """
-        # Read the input image using OpenCV
-        self.img = cv2.imread(self.input_image)
-
-        # Get the height and width of the input image
-        self.img_height, self.img_width = self.img.shape[:2]
-        print("------------------------",self.img.shape, self.img_height, self.img_width, self.input_width, self.input_height)
-
+        print("---------aaaaaaaaaaa--------", self.input_width, self.input_height)
         # Convert the image color space from BGR to RGB
         img = cv2.cvtColor(self.img, cv2.COLOR_BGR2RGB)
 
@@ -125,7 +209,7 @@ class YOLOv8:
         """
 
         # Transpose and squeeze the output to match the expected shape
-        outputs = np.transpose(np.squeeze(output[0]))
+        outputs = np.transpose(np.squeeze(output))
 
         # Get the number of rows in the outputs array
         rows = outputs.shape[0]
@@ -190,26 +274,33 @@ class YOLOv8:
             output_img: The output image with drawn detections.
         """
         # Create an inference session using the ONNX model and specify execution providers
-        session = ort.InferenceSession(self.onnx_model, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        #session = ort.InferenceSession(self.onnx_model, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
 
         # Get the model inputs
-        model_inputs = session.get_inputs()
+        #model_inputs = session.get_inputs()
 
         # Store the shape of the input for later use
-        input_shape = model_inputs[0].shape
-        self.input_width = input_shape[2]
-        self.input_height = input_shape[3]
+        #input_shape = model_inputs[0].shape
+        #self.input_width = input_shape[2]
+        #self.input_height = input_shape[3]
+        
+        
+         # Read the input image using OpenCV
+        self.img = cv2.imread(self.input_image)
+        # Get the height and width of the input image
+        self.img_height, self.img_width = self.img.shape[:2]
+        #self.input_width = self.img_width
+        #self.input_height = self.img_height
+        
 
         # Preprocess the image data
-        img_data = self.preprocess()
-        print("---xxxxx-----pre-------",type(img_data))
-        print("---xxxxx-----pre-------",img_data.shape)
+        #img_data = self.preprocess()
 
         # Run inference using the preprocessed image data
-        outputs = session.run(None, {model_inputs[0].name: img_data})
-        
-        print("---xxxxx-----infer-------",type(outputs[0]))
-        print("---xxxxx-----infer-------",outputs[0].shape)
+        outputs = self.infer()
+        outputs = np.reshape(outputs,[1,84,8400])
+        print("---xxxxx-----out-------",type(outputs))
+        print("---xxxxx-----out-------",outputs.shape)
 
         # Perform post-processing on the outputs to obtain output image.
         return self.postprocess(self.img, outputs)  # output image
@@ -218,7 +309,7 @@ class YOLOv8:
 if __name__ == '__main__':
     # Create an argument parser to handle command-line arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='yolov8n.onnx', help='Input your ONNX model.')
+    parser.add_argument('--model', type=str, default='/root/zjx/ultralytics/yolov8n.engine', help='Input your ONNX model.')
     parser.add_argument('--img', type=str, default=str(ASSETS / 'bus.jpg'), help='Path to input image.')
     parser.add_argument('--conf-thres', type=float, default=0.5, help='Confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='NMS IoU threshold')
@@ -238,10 +329,4 @@ if __name__ == '__main__':
     print(output_image.shape)
     save_name = os.path.join('output', 'bus.jpg')
     cv2.imwrite(save_name, output_image)
-
-    # Display the output image in a window
-    #cv2.namedWindow('Output', cv2.WINDOW_NORMAL)
-    #cv2.imshow('Output', output_image)
-
-    # Wait for a key press to exit
-    #cv2.waitKey(0)
+    detection.ctx.pop()
